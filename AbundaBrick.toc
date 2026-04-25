@@ -3,6 +3,7 @@
 ## Notes: Tracks Restoration Druid Abundance stacks as colored bricks
 ## Author: Goldtoe
 ## Version: 1.0.0
+## X-Curse-Project-ID: 1524973
 ## SavedVariables: AbundaBrickDB
 
 AbundaBrick.lua
