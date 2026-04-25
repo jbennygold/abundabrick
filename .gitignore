@@ -1,0 +1,7 @@
+# Reference materials (sample screenshots, third-party addon source for inspiration)
+reference/
+
+# Saved variables and OS junk
+*.lua.bak
+.DS_Store
+Thumbs.db

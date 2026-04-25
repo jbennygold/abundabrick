@@ -1,0 +1,8 @@
+package-as: AbundaBrick
+manual-changelog: CHANGELOG.md
+
+ignore:
+  - .github
+  - .pkgmeta
+  - reference
+  - LICENSE
