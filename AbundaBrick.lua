@@ -11,6 +11,9 @@ local math_min = math.min
 local GetPlayerAuraBySpellID = C_UnitAuras.GetPlayerAuraBySpellID
 local InCombatLockdown = InCombatLockdown
 local CreateFrame = CreateFrame
+local UnitClass = UnitClass
+local GetSpecialization = GetSpecialization
+local GetSpecializationInfo = GetSpecializationInfo
 
 ---------------------------
 -- Constants
@@ -19,6 +22,7 @@ local CreateFrame = CreateFrame
 -- It's a private aura that doesn't fire UNIT_AURA reliably, so we poll.
 local ABUNDANCE_SPELL_ID = 207640
 local MAX_STACKS = 10
+local RESTO_DRUID_SPEC_ID = 105
 
 local SOLID = "Interface\\Buttons\\WHITE8X8"
 
@@ -69,6 +73,7 @@ local function CreateBar()
     bar:SetClampedToScreen(true)
     bar:SetMovable(true)
     bar:EnableMouse(false)
+    bar:Hide() -- stay hidden until Refresh decides we should show
 
     -- Background
     local bg = bar:CreateTexture(nil, "BACKGROUND")
@@ -239,6 +244,22 @@ function addon:GetAbundanceStacks()
     return aura.applications or 0
 end
 
+function addon:IsRestoDruid()
+    local _, class = UnitClass("player")
+    if class ~= "DRUID" then return false end
+    local specIndex = GetSpecialization()
+    if not specIndex then return false end
+    local specID = GetSpecializationInfo(specIndex)
+    return specID == RESTO_DRUID_SPEC_ID
+end
+
+function addon:UpdateActiveSpec()
+    self._isResto = self:IsRestoDruid()
+    -- Force the next Refresh to re-evaluate.
+    self._lastStacks = nil
+    self:Refresh()
+end
+
 function addon:UpdateBricks(stacks)
     local bar = self.bar
     if not bar then return end
@@ -269,6 +290,10 @@ function addon:UpdateBricks(stacks)
 end
 
 function addon:Refresh()
+    if not self._isResto then
+        if self.bar and self.bar:IsShown() then self.bar:Hide() end
+        return
+    end
     local stacks = self:GetAbundanceStacks()
     if stacks == self._lastStacks then return end
     self._lastStacks = stacks
@@ -284,6 +309,12 @@ eventFrame:SetScript("OnEvent", function(_, event, ...)
     local fn = addon[event]
     if fn then fn(addon, ...) end
 end)
+
+function addon:PLAYER_SPECIALIZATION_CHANGED(unit)
+    if unit == "player" then
+        self:UpdateActiveSpec()
+    end
+end
 
 ---------------------------
 -- Polling
@@ -404,7 +435,9 @@ function addon:PLAYER_LOGIN()
     self:Options()
     self:InitCommands()
     self:InitPoller()
-    self:Refresh()
+
+    eventFrame:RegisterUnitEvent("PLAYER_SPECIALIZATION_CHANGED", "player")
+    self:UpdateActiveSpec()
 
     self:Print("Loaded. Type |cFFE8C547/abrick|r for options.")
 end

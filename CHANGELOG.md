@@ -1,5 +1,10 @@
 # AbundaBrick
 
+## v1.0.1 (2026-04-26)
+
+- Bar is now hidden on non-Restoration-Druid characters and specs.
+- Re-evaluates on `PLAYER_SPECIALIZATION_CHANGED` so it shows/hides correctly when switching specs in-session.
+
 ## v1.0.0 (2026-04-25)
 
 - Initial release.
