@@ -12,17 +12,35 @@ local GetPlayerAuraBySpellID = C_UnitAuras.GetPlayerAuraBySpellID
 local InCombatLockdown = InCombatLockdown
 local CreateFrame = CreateFrame
 local UnitClass = UnitClass
+local UnitGUID = UnitGUID
 local GetSpecialization = GetSpecialization
 local GetSpecializationInfo = GetSpecializationInfo
+local GetTime = GetTime
+local string_format = string.format
+local table_insert = table.insert
+local table_remove = table.remove
+local table_wipe = wipe
 
 ---------------------------
 -- Constants
 ---------------------------
 -- Abundance buff: this is the visible stacking aura, not the talent ID (207383).
--- It's a private aura that doesn't fire UNIT_AURA reliably, so we poll.
+-- It's a private aura that doesn't fire UNIT_AURA reliably, AND is hidden
+-- from the aura API entirely while in combat in instanced content.
+-- We poll the API (works out-of-combat) and track our own Rejuv casts as
+-- a fallback so the bar still works during pulls.
 local ABUNDANCE_SPELL_ID = 207640
 local MAX_STACKS = 10
 local RESTO_DRUID_SPEC_ID = 105
+
+-- Spells that grant a stack of Abundance (one stack per active aura).
+local REJUV_SPELL_IDS = {
+    [774] = true,    -- Rejuvenation
+    [155777] = true, -- Germination
+}
+-- Approximate Rejuv base duration. Talents/empowerment can extend it; the
+-- count will recover on the next out-of-combat poll when the API returns.
+local REJUV_DURATION = 15
 
 local SOLID = "Interface\\Buttons\\WHITE8X8"
 
@@ -55,6 +73,7 @@ local defaults = {
     showEmptyBricks = true,
     spacing = 2,
     padding = 2,
+    debugLog = false, -- diagnostic log: off by default, /abrick log on enables
     ver = 1,
 }
 
@@ -238,10 +257,147 @@ end
 ---------------------------
 -- Stack update
 ---------------------------
+-- Per-target tracking: "<target>:<spellID>" -> expireTime. Refreshing on the
+-- same target overwrites the same key, so refreshes don't double-count.
+addon._byTarget = {}
+-- castGUID -> target name, populated on _SENT, consumed on _SUCCEEDED.
+addon._sentMap = {}
+-- Flat fallback list for casts where _SENT didn't fire / had no target.
+addon._castExpires = {}
+
+function addon:GetTrackedStacks()
+    local now = GetTime()
+    local count = 0
+    -- Per-target entries (refresh-aware)
+    for key, expire in pairs(self._byTarget) do
+        if expire > now then
+            count = count + 1
+        else
+            self._byTarget[key] = nil
+        end
+    end
+    -- Flat fallback entries
+    for i = #self._castExpires, 1, -1 do
+        if self._castExpires[i] > now then
+            count = count + 1
+        else
+            table_remove(self._castExpires, i)
+        end
+    end
+    if count > MAX_STACKS then count = MAX_STACKS end
+    return count
+end
+
+-- Count player-applied Rejuv/Germination auras on group members.
+-- Works out of combat / outside instances. In instance combat, aura fields
+-- like spellId and name are returned as SECRET values which can't be used
+-- as table keys or compared, so this function bails out and the caller
+-- falls through to the cast tracker.
+local issecretvalue = issecretvalue or function() return false end
+
+function addon:CountGroupRejuvs()
+    local count = 0
+    local function scanUnit(unit)
+        if not UnitExists(unit) then return end
+        for i = 1, 40 do
+            local data = C_UnitAuras.GetAuraDataByIndex(unit, i, "HELPFUL|PLAYER")
+            if not data then break end
+            local sid = data.spellId
+            -- Secret values can't be used as keys / compared — skip them.
+            if sid and not issecretvalue(sid) then
+                -- pcall is belt-and-braces in case future patches add new
+                -- secret kinds we don't recognize.
+                local ok, isRejuv = pcall(function() return REJUV_SPELL_IDS[sid] end)
+                if ok and isRejuv then
+                    count = count + 1
+                end
+            end
+        end
+    end
+
+    if IsInRaid() then
+        for i = 1, 40 do scanUnit("raid" .. i) end
+    else
+        scanUnit("player")
+        for i = 1, 4 do scanUnit("party" .. i) end
+    end
+
+    if count > MAX_STACKS then count = MAX_STACKS end
+    return count
+end
+
 function addon:GetAbundanceStacks()
     local aura = GetPlayerAuraBySpellID(ABUNDANCE_SPELL_ID)
-    if not aura then return 0 end
-    return aura.applications or 0
+    local apiStacks = 0
+    if aura and aura.applications and not issecretvalue(aura.applications) then
+        apiStacks = aura.applications
+    end
+    local groupCount = self:CountGroupRejuvs()
+    local authoritative = math_max(apiStacks, groupCount)
+
+    -- When an authoritative source can read stacks, return that AND seed the
+    -- tracker so it has a reasonable starting state if the source is silenced
+    -- a moment later (e.g., combat begins inside an instance).
+    if authoritative > 0 then
+        local tracked = self:GetTrackedStacks()
+        if authoritative > tracked then
+            -- Authoritative source sees more than we've tracked — seed up
+            -- so the tracker survives if the source is silenced next tick.
+            local seedTime = GetTime() + REJUV_DURATION
+            for _ = 1, authoritative - tracked do
+                table_insert(self._castExpires, seedTime)
+            end
+        elseif authoritative < tracked then
+            -- Authoritative source sees less — refresh-overcount cleanup.
+            -- Drop oldest entries from the flat fallback list first; if we
+            -- still need to trim, drop oldest per-target entries.
+            local diff = tracked - authoritative
+            table.sort(self._castExpires)
+            local toRemove = math_min(diff, #self._castExpires)
+            for _ = 1, toRemove do
+                table_remove(self._castExpires, 1)
+            end
+            diff = diff - toRemove
+            if diff > 0 then
+                local entries = {}
+                for k, v in pairs(self._byTarget) do
+                    entries[#entries + 1] = { k, v }
+                end
+                table.sort(entries, function(a, b) return a[2] < b[2] end)
+                for i = 1, math_min(diff, #entries) do
+                    self._byTarget[entries[i][1]] = nil
+                end
+            end
+        end
+        return authoritative
+    end
+
+    -- Both authoritative sources are silenced: rely on cast tracker.
+    return self:GetTrackedStacks()
+end
+
+function addon:UNIT_SPELLCAST_SENT(unit, target, castGUID, spellID)
+    if unit ~= "player" then return end
+    if not REJUV_SPELL_IDS[spellID] then return end
+    if target and target ~= "" and castGUID then
+        self._sentMap[castGUID] = target
+    end
+end
+
+function addon:UNIT_SPELLCAST_SUCCEEDED(unit, castGUID, spellID)
+    if unit ~= "player" then return end
+    if not REJUV_SPELL_IDS[spellID] then return end
+    local expireAt = GetTime() + REJUV_DURATION
+    local target = self._sentMap[castGUID]
+    self._sentMap[castGUID] = nil
+    if target then
+        -- Per-target: same key overwrites on refresh -> no double count.
+        self._byTarget[target .. ":" .. spellID] = expireAt
+    else
+        -- Unknown target: fall back to flat list (may over-count refreshes
+        -- but keeps the bar from going empty).
+        table_insert(self._castExpires, expireAt)
+    end
 end
 
 function addon:IsRestoDruid()
@@ -259,6 +415,22 @@ function addon:UpdateActiveSpec()
     self._lastStacks = nil
     self:Refresh()
 end
+
+---------------------------
+-- Diagnostic log
+-- Records aura-API state, combat-log Abundance events, and zone changes so
+-- we can compare what the API says vs. what the combat log says.
+-- Always recording (low overhead, only logs on changes).
+---------------------------
+local LOG_MAX = 150
+addon._log = {}
+
+local function pushLog(text)
+    if not (addon.db and addon.db.debugLog) then return end
+    table_insert(addon._log, string_format("[%.1f] %s", GetTime(), text))
+    if #addon._log > LOG_MAX then table_remove(addon._log, 1) end
+end
+
 
 function addon:UpdateBricks(stacks)
     local bar = self.bar
@@ -294,8 +466,49 @@ function addon:Refresh()
         if self.bar and self.bar:IsShown() then self.bar:Hide() end
         return
     end
+
+    -- Diagnostic: log instance and combat state changes via polling
+    -- (we deliberately avoid registering more events to dodge taint issues
+    -- some users have hit with additional event registrations.)
+    local _, instanceType = IsInInstance()
+    if instanceType ~= self._lastInstance then
+        pushLog(string_format("ZONE inst=%s", tostring(instanceType)))
+        self._lastInstance = instanceType
+    end
+    local inCombat = UnitAffectingCombat("player") and true or false
+    if inCombat ~= self._lastCombat then
+        pushLog(inCombat and "COMBAT_ENTER" or "COMBAT_LEAVE")
+        self._lastCombat = inCombat
+    end
+
     local stacks = self:GetAbundanceStacks()
+    local aura = GetPlayerAuraBySpellID(ABUNDANCE_SPELL_ID)
+    local apiOnly = 0
+    if aura and aura.applications and not issecretvalue(aura.applications) then
+        apiOnly = aura.applications
+    end
+    local groupOnly = self:CountGroupRejuvs()
+    local trackedOnly = self:GetTrackedStacks()
+
+    -- Diagnostic logging (opt-in via /abrick log on).
+    if self.db.debugLog then
+        local now = GetTime()
+        if inCombat and (now - (self._lastCombatTickLog or 0) >= 1.0) then
+            self._lastCombatTickLog = now
+            pushLog(string_format("tick stacks=%d  api=%d  group=%d  tracked=%d",
+                stacks, apiOnly, groupOnly, trackedOnly))
+        elseif not inCombat then
+            self._lastCombatTickLog = nil
+        end
+    end
+
     if stacks == self._lastStacks then return end
+    if self.db.debugLog then
+        pushLog(string_format("stacks=%d (was %s)  api=%d  group=%d  tracked=%d  combat=%s  inst=%s",
+            stacks, tostring(self._lastStacks),
+            apiOnly, groupOnly, trackedOnly,
+            tostring(inCombat), tostring(instanceType)))
+    end
     self._lastStacks = stacks
     self:UpdateBricks(stacks)
 end
@@ -305,12 +518,15 @@ end
 ---------------------------
 local eventFrame = CreateFrame("Frame")
 eventFrame:RegisterEvent("PLAYER_LOGIN")
+eventFrame:RegisterUnitEvent("UNIT_SPELLCAST_SENT", "player")
+eventFrame:RegisterUnitEvent("UNIT_SPELLCAST_SUCCEEDED", "player")
 eventFrame:SetScript("OnEvent", function(_, event, ...)
     local fn = addon[event]
     if fn then fn(addon, ...) end
 end)
 
 function addon:PLAYER_SPECIALIZATION_CHANGED(unit)
+    if not self.bar then return end -- not yet initialized
     if unit == "player" then
         self:UpdateActiveSpec()
     end
@@ -389,12 +605,45 @@ function addon:InitCommands()
             self._testStacks = stacks
             self:UpdateBricks(stacks)
             self:Print("Test stacks:", stacks)
+        elseif msg == "log" or msg == "log show" then
+            local _, inst = IsInInstance()
+            local aura = GetPlayerAuraBySpellID(ABUNDANCE_SPELL_ID)
+            local apiOnly = 0
+            if aura and aura.applications and not issecretvalue(aura.applications) then
+                apiOnly = aura.applications
+            end
+            self:Print(string_format("=== log (%d entries, recording=%s) ===",
+                #self._log, self.db.debugLog and "on" or "off"))
+            for _, line in ipairs(self._log) do
+                self:Print(line)
+            end
+            self:Print(string_format("=== now: stacks=%d  api=%d  group=%d  tracked=%d  combat=%s  inst=%s  isResto=%s ===",
+                self:GetAbundanceStacks(),
+                apiOnly,
+                self:CountGroupRejuvs(),
+                self:GetTrackedStacks(),
+                tostring(UnitAffectingCombat("player") and true or false),
+                tostring(inst),
+                tostring(self._isResto)))
+        elseif msg == "log on" then
+            self.db.debugLog = true
+            self:Print("Diagnostic log: ON")
+        elseif msg == "log off" then
+            self.db.debugLog = false
+            self:Print("Diagnostic log: OFF (existing entries kept; '/abrick log clear' to wipe)")
+        elseif msg == "log clear" then
+            table_wipe(self._log)
+            self:Print("Log cleared.")
         elseif msg == "help" then
             self:Print("/abrick           - open options")
             self:Print("/abrick lock      - lock the bar")
             self:Print("/abrick unlock    - unlock the bar")
             self:Print("/abrick reset     - reset position and size")
             self:Print("/abrick test      - cycle test stack counts")
+            self:Print("/abrick log on    - turn on diagnostic logging")
+            self:Print("/abrick log off   - turn off diagnostic logging")
+            self:Print("/abrick log       - dump diagnostic log")
+            self:Print("/abrick log clear - clear diagnostic log")
         else
             if InCombatLockdown() then
                 self:Print("Cannot open options while in combat.")
@@ -436,6 +685,7 @@ function addon:PLAYER_LOGIN()
     self:InitCommands()
     self:InitPoller()
 
+    self._playerGUID = UnitGUID("player")
     eventFrame:RegisterUnitEvent("PLAYER_SPECIALIZATION_CHANGED", "player")
     self:UpdateActiveSpec()
 
